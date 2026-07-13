@@ -78,18 +78,27 @@ print("Téléchargement du fichier source LOVAC (vacance locative)...")
 urllib.request.urlretrieve(LOVAC_URL, TMP_LOVAC)
 print("Téléchargé.")
 
+nb_lignes_lues = 0
+nb_vacance_ajoutees = 0
 with open(TMP_LOVAC, encoding="latin-1") as f:
     reader = csv.DictReader(f, delimiter=";")
+    print("DIAGNOSTIC - Colonnes LOVAC détectées:", reader.fieldnames)
     for row in reader:
-        code = row["CODGEO_26"]
-        vacants = to_int_lovac(row["pp_vacant_25"])
-        total = to_int_lovac(row["ff_pp_total_25"])
+        nb_lignes_lues += 1
+        code = row.get("CODGEO_26")
+        vacants = to_int_lovac(row.get("pp_vacant_25"))
+        total = to_int_lovac(row.get("ff_pp_total_25"))
+        if nb_lignes_lues <= 3:
+            print(f"DIAGNOSTIC - ligne {nb_lignes_lues}: code={code!r} vacants={vacants!r} total={total!r}")
         if vacants is None or not total:
             continue
         taux = round(vacants / total * 100, 1)
         if code not in result:
             result[code] = {"nom": row["LIBGEO_26"]}
         result[code]["vacance"] = {"taux": taux, "millesime": 2025}
+        nb_vacance_ajoutees += 1
+
+print(f"DIAGNOSTIC - {nb_lignes_lues} lignes LOVAC lues, {nb_vacance_ajoutees} taux de vacance ajoutés.")
 
 with open(DEST_JSON, "w", encoding="utf-8") as f:
     json.dump(result, f, ensure_ascii=False, separators=(",", ":"))
