@@ -50,7 +50,15 @@ with open(TMP_CSV, encoding="utf-8") as f:
                 "mediane": to_int(row["med_prix_m2_whole_maison"]),
             }
 
-        if "appartement" in entry or "maison" in entry:
+        nb_local = to_int(row["nb_ventes_whole_local"])
+        if nb_local:
+            entry["local"] = {
+                "nb": nb_local,
+                "moyenne": to_int(row["moy_prix_m2_whole_local"]),
+                "mediane": to_int(row["med_prix_m2_whole_local"]),
+            }
+
+        if "appartement" in entry or "maison" in entry or "local" in entry:
             result[code] = entry
 
 with open(DEST_JSON, "w", encoding="utf-8") as f:
