@@ -1,6 +1,7 @@
 """
 Télécharge le fichier officiel "Statistiques DVF" (data.gouv.fr / Etalab)
-et regénère prix-communes.json (prix moyen/médian par commune).
+et le fichier LOVAC (logements vacants, data.gouv.fr / Cerema), et régénère
+prix-communes.json (prix moyen/médian, et taux de vacance locative, par commune).
 
 Ce script est destiné à être exécuté automatiquement par GitHub Actions
 (voir .github/workflows/update-prix.yml), mais peut aussi être lancé
@@ -13,11 +14,23 @@ import urllib.request
 
 SOURCE_URL = "https://www.data.gouv.fr/api/1/datasets/r/851d342f-9c96-41c1-924a-11a7a7aae8a6"
 TMP_CSV = "statistiques_dvf.csv"
+LOVAC_URL = "https://www.data.gouv.fr/api/1/datasets/r/2e0417b4-902d-4c60-90e7-bf5df148cb87"
+TMP_LOVAC = "lovac.csv"
 DEST_JSON = "prix-communes.json"
 
 
 def to_int(v):
     return int(v) if v not in (None, "", "0") else None
+
+
+def to_int_lovac(v):
+    v = (v or "").strip()
+    if v in ("", "s"):
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        return None
 
 
 print("Téléchargement du fichier source DVF...")
@@ -60,6 +73,23 @@ with open(TMP_CSV, encoding="utf-8") as f:
 
         if "appartement" in entry or "maison" in entry or "local" in entry:
             result[code] = entry
+
+print("Téléchargement du fichier source LOVAC (vacance locative)...")
+urllib.request.urlretrieve(LOVAC_URL, TMP_LOVAC)
+print("Téléchargé.")
+
+with open(TMP_LOVAC, encoding="latin-1") as f:
+    reader = csv.DictReader(f, delimiter=";")
+    for row in reader:
+        code = row["CODGEO_26"]
+        vacants = to_int_lovac(row["pp_vacant_25"])
+        total = to_int_lovac(row["ff_pp_total_25"])
+        if vacants is None or not total:
+            continue
+        taux = round(vacants / total * 100, 1)
+        if code not in result:
+            result[code] = {"nom": row["LIBGEO_26"]}
+        result[code]["vacance"] = {"taux": taux, "millesime": 2025}
 
 with open(DEST_JSON, "w", encoding="utf-8") as f:
     json.dump(result, f, ensure_ascii=False, separators=(",", ":"))
