@@ -4,8 +4,11 @@ Télécharge :
   commune et par département
 - le fichier LOVAC (logements vacants, data.gouv.fr / Cerema) : vacance par
   commune et par département
-- les 4 fichiers "Carte des loyers 2025" (data.gouv.fr / ANIL), un par
-  typologie (toutes tailles, T1-T2, T3+, maison) : loyer par commune
+- les 4 fichiers "Carte des loyers" (data.gouv.fr / ANIL), un par typologie
+  (toutes tailles, T1-T2, T3+, maison) : loyer par commune. L'édition la plus
+  récente est recherchée automatiquement chaque année (le jeu de données
+  change d'adresse à chaque nouvelle édition annuelle) ; à défaut, on retombe
+  sur l'édition 2025 dont les URLs sont connues et fiables.
 
 ... et régénère prix-communes.json avec toutes ces données, par commune ET
 par département (moyenne pondérée par nombre d'observations pour les loyers).
@@ -16,6 +19,7 @@ manuellement : python update_prix.py
 """
 
 import csv
+import datetime
 import json
 import urllib.request
 
@@ -25,14 +29,15 @@ LOVAC_URL = "https://www.data.gouv.fr/api/1/datasets/r/2e0417b4-902d-4c60-90e7-b
 TMP_LOVAC = "lovac.csv"
 DEST_JSON = "prix-communes.json"
 
-# Un fichier par typologie de loyer (identifiés et vérifiés manuellement sur
-# une commune connue - voir historique du projet)
-LOYERS_FICHIERS = {
+# Repli garanti : URLs de l'édition 2025, vérifiées manuellement (voir
+# historique du projet - typologies confirmées sur Bourg-en-Bresse, 01053).
+LOYERS_FICHIERS_2025 = {
     "toutes": "https://www.data.gouv.fr/api/1/datasets/r/55b34088-0964-415f-9df7-d87dd98a09be",
     "t1t2": "https://www.data.gouv.fr/api/1/datasets/r/14a1fe11-b2d1-49b3-9f6b-83d12df9482c",
     "t3plus": "https://www.data.gouv.fr/api/1/datasets/r/5e3b28a4-cf56-43a3-ae79-43cceeb27f8c",
     "maison": "https://www.data.gouv.fr/api/1/datasets/r/129f764d-b613-44e4-952c-5ff50a8c9b73",
 }
+COMMUNE_REFERENCE = "01053"  # Bourg-en-Bresse : sert à identifier les typologies automatiquement
 
 
 def to_int(v):
@@ -67,6 +72,99 @@ def code_to_dept(code):
     if code.startswith("97") or code.startswith("98"):
         return code[:3]
     return code[:2]
+
+
+def get_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "immo-renta-simulateur/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def lire_commune_reference(url):
+    """Télécharge un fichier de loyer et renvoie (loyer, nbobs_com) pour la
+    commune de référence, ou None si absent/illisible."""
+    tmp = "_tmp_ref.csv"
+    urllib.request.urlretrieve(url, tmp)
+    with open(tmp, encoding="latin-1") as f:
+        reader = csv.DictReader(f, delimiter=";")
+        for row in reader:
+            if row.get("INSEE_C") == COMMUNE_REFERENCE:
+                loyer = to_float_fr(row.get("loypredm2"))
+                nb = to_int(row.get("nbobs_com")) or 0
+                if loyer is not None:
+                    return loyer, nb
+    return None
+
+
+def identifier_typologies(urls):
+    """À partir de 4 URLs de fichiers "Carte des loyers", détermine
+    automatiquement laquelle correspond à quelle typologie, en se basant sur
+    la commune de référence :
+    - le fichier avec le MOINS d'observations = maison
+    - parmi les 3 restants (appartements), celui avec le PLUS d'observations
+      = toutes tailles confondues (jeu de données le plus large)
+    - parmi les 2 restants, le loyer le plus élevé = T1-T2, le plus bas = T3+
+    Renvoie {typologie: url} ou None si l'identification échoue.
+    """
+    mesures = []
+    for url in urls:
+        r = lire_commune_reference(url)
+        if r is None:
+            return None
+        loyer, nb = r
+        mesures.append({"url": url, "loyer": loyer, "nb": nb})
+
+    if len(mesures) != 4:
+        return None
+
+    mesures.sort(key=lambda m: m["nb"])
+    maison = mesures[0]
+    reste = mesures[1:]
+    reste.sort(key=lambda m: m["nb"], reverse=True)
+    toutes = reste[0]
+    appts = reste[1:]
+    appts.sort(key=lambda m: m["loyer"], reverse=True)
+    t1t2, t3plus = appts[0], appts[1]
+
+    return {
+        "toutes": toutes["url"],
+        "t1t2": t1t2["url"],
+        "t3plus": t3plus["url"],
+        "maison": maison["url"],
+    }
+
+
+def trouver_edition_loyers():
+    """Cherche la dernière édition "Carte des loyers" disponible sur
+    data.gouv.fr (nouvelle adresse à chaque nouvelle édition annuelle), et
+    identifie automatiquement les 4 fichiers par typologie. Retombe sur
+    l'édition 2025 (connue et fiable) si rien de plus récent n'est trouvé ou
+    reconnu.
+    """
+    annee_courante = datetime.date.today().year
+    for annee in range(annee_courante + 1, 2024, -1):
+        slug = f"carte-des-loyers-indicateurs-de-loyers-dannonce-par-commune-en-{annee}"
+        try:
+            data = get_json(f"https://www.data.gouv.fr/api/1/datasets/{slug}/")
+        except Exception:
+            continue
+
+        resources = [
+            r for r in data.get("resources", [])
+            if (r.get("format") or "").lower() == "csv"
+            and (r.get("filesize") or 0) > 1_000_000  # écarte d'éventuels petits fichiers annexes
+        ]
+        if len(resources) != 4:
+            continue
+
+        urls = [r["url"] for r in resources]
+        typologies = identifier_typologies(urls)
+        if typologies:
+            print(f"Édition {annee} de la Carte des loyers trouvée et identifiée automatiquement.")
+            return typologies, annee
+
+    print("Aucune édition plus récente trouvée/reconnue : repli sur l'édition 2025 (connue).")
+    return LOYERS_FICHIERS_2025, 2025
 
 
 result = {}
@@ -160,15 +258,18 @@ for dept, total in dept_total.items():
 print(f"Vacance agrégée pour {len(dept_total)} départements.")
 
 # ---------------------------------------------------------------------------
-# 3) Carte des loyers 2025, PAR COMMUNE, une fois par typologie
-#    (toutes tailles / T1-T2 / T3+ / maison). Agrégation par département en
-#    moyenne pondérée par nombre d'observations.
+# 3) Carte des loyers, PAR COMMUNE, une fois par typologie
+#    (toutes tailles / T1-T2 / T3+ / maison). Édition la plus récente trouvée
+#    automatiquement. Agrégation par département en moyenne pondérée par
+#    nombre d'observations.
 # ---------------------------------------------------------------------------
+LOYERS_FICHIERS, millesime_loyers = trouver_edition_loyers()
+
 dept_loyer_pondere = {t: {} for t in LOYERS_FICHIERS}
 dept_loyer_poids = {t: {} for t in LOYERS_FICHIERS}
 
 for typologie, url in LOYERS_FICHIERS.items():
-    print(f"Téléchargement Carte des loyers - {typologie}...")
+    print(f"Téléchargement Carte des loyers {millesime_loyers} - {typologie}...")
     tmp = f"loyers_{typologie}.csv"
     urllib.request.urlretrieve(url, tmp)
     print("Téléchargé.")
@@ -210,12 +311,13 @@ for typologie in LOYERS_FICHIERS:
                 dept_loyer_pondere[typologie][dept] / poids, 2
             )
 
-print("Loyers par typologie intégrés (commune + département).")
+print(f"Loyers {millesime_loyers} par typologie intégrés (commune + département).")
 
 # ---------------------------------------------------------------------------
 result["departements"] = departements
+result["_millesime_loyers"] = millesime_loyers
 
 with open(DEST_JSON, "w", encoding="utf-8") as f:
     json.dump(result, f, ensure_ascii=False, separators=(",", ":"))
 
-print(f"{len(result) - 1} communes + {len(departements)} départements exportés dans {DEST_JSON}")
+print(f"{len(result) - 2} communes + {len(departements)} départements exportés dans {DEST_JSON}")
