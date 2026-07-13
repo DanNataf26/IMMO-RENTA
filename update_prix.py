@@ -1,10 +1,14 @@
 """
-Télécharge les fichiers officiels "Statistiques DVF" (data.gouv.fr / Etalab),
-LOVAC (logements vacants, data.gouv.fr / Cerema) et interroge la "Carte des
-loyers" (ANIL, via ArcGIS), pour régénérer prix-communes.json :
-- prix moyen/médian et taux de vacance locative, par commune ET par département
-- loyer moyen par département (moyenne pondérée des communes, calculée à la volée
-  car la Carte des loyers n'est disponible que commune par commune)
+Télécharge :
+- le fichier officiel "Statistiques DVF" (data.gouv.fr / Etalab) : prix par
+  commune et par département
+- le fichier LOVAC (logements vacants, data.gouv.fr / Cerema) : vacance par
+  commune et par département
+- les 4 fichiers "Carte des loyers 2025" (data.gouv.fr / ANIL), un par
+  typologie (toutes tailles, T1-T2, T3+, maison) : loyer par commune
+
+... et régénère prix-communes.json avec toutes ces données, par commune ET
+par département (moyenne pondérée par nombre d'observations pour les loyers).
 
 Ce script est destiné à être exécuté automatiquement par GitHub Actions
 (voir .github/workflows/update-prix.yml), mais peut aussi être lancé
@@ -19,8 +23,16 @@ SOURCE_URL = "https://www.data.gouv.fr/api/1/datasets/r/851d342f-9c96-41c1-924a-
 TMP_CSV = "statistiques_dvf.csv"
 LOVAC_URL = "https://www.data.gouv.fr/api/1/datasets/r/2e0417b4-902d-4c60-90e7-bf5df148cb87"
 TMP_LOVAC = "lovac.csv"
-LOYERS_BASE = "https://services.arcgis.com/d3voDfTFbHOCRwVR/ArcGIS/rest/services/Carte_des_loyers__Jan_2024_/FeatureServer"
 DEST_JSON = "prix-communes.json"
+
+# Un fichier par typologie de loyer (identifiés et vérifiés manuellement sur
+# une commune connue - voir historique du projet)
+LOYERS_FICHIERS = {
+    "toutes": "https://www.data.gouv.fr/api/1/datasets/r/55b34088-0964-415f-9df7-d87dd98a09be",
+    "t1t2": "https://www.data.gouv.fr/api/1/datasets/r/14a1fe11-b2d1-49b3-9f6b-83d12df9482c",
+    "t3plus": "https://www.data.gouv.fr/api/1/datasets/r/5e3b28a4-cf56-43a3-ae79-43cceeb27f8c",
+    "maison": "https://www.data.gouv.fr/api/1/datasets/r/129f764d-b613-44e4-952c-5ff50a8c9b73",
+}
 
 
 def to_int(v):
@@ -33,6 +45,17 @@ def to_int_lovac(v):
         return None
     try:
         return int(v)
+    except ValueError:
+        return None
+
+
+def to_float_fr(v):
+    """Nombre au format français (virgule décimale) -> float, ou None."""
+    v = (v or "").strip()
+    if not v:
+        return None
+    try:
+        return float(v.replace(",", "."))
     except ValueError:
         return None
 
@@ -137,74 +160,57 @@ for dept, total in dept_total.items():
 print(f"Vacance agrégée pour {len(dept_total)} départements.")
 
 # ---------------------------------------------------------------------------
-# 3) Carte des loyers : disponible uniquement par commune -> on interroge
-#    toutes les communes (pagination) et on calcule une moyenne pondérée
-#    (par nombre d'observations) par département.
+# 3) Carte des loyers 2025, PAR COMMUNE, une fois par typologie
+#    (toutes tailles / T1-T2 / T3+ / maison). Agrégation par département en
+#    moyenne pondérée par nombre d'observations.
 # ---------------------------------------------------------------------------
-def fetch_loyers_layer(layer_id):
-    """Récupère {code_insee: (loypredm2, nbobs_com)} pour une couche (0=appt, 1=maison)."""
-    donnees = {}
-    offset = 0
-    page_size = 2000
-    while True:
-        url = (
-            f"{LOYERS_BASE}/{layer_id}/query?where=1%3D1"
-            f"&outFields=INSEE_COM,loypredm2,nbobs_com&returnGeometry=false&f=json"
-            f"&resultRecordCount={page_size}&resultOffset={offset}"
-        )
-        with urllib.request.urlopen(url, timeout=60) as r:
-            data = json.loads(r.read().decode("utf-8"))
-        feats = data.get("features", [])
-        for feat in feats:
-            attrs = feat.get("attributes", {})
-            code = attrs.get("INSEE_COM")
-            loyer = attrs.get("loypredm2")
-            nb = attrs.get("nbobs_com") or 0
-            if code and loyer:
-                donnees[code] = (loyer, nb)
-        offset += page_size
-        if not data.get("exceededTransferLimit"):
-            break
-    return donnees
+dept_loyer_pondere = {t: {} for t in LOYERS_FICHIERS}
+dept_loyer_poids = {t: {} for t in LOYERS_FICHIERS}
 
+for typologie, url in LOYERS_FICHIERS.items():
+    print(f"Téléchargement Carte des loyers - {typologie}...")
+    tmp = f"loyers_{typologie}.csv"
+    urllib.request.urlretrieve(url, tmp)
+    print("Téléchargé.")
 
-print("Interrogation de la Carte des loyers (appartements)...")
-loyers_appt = fetch_loyers_layer(0)
-print(f"{len(loyers_appt)} communes (appartements).")
+    with open(tmp, encoding="latin-1") as f:
+        reader = csv.DictReader(f, delimiter=";")
+        for row in reader:
+            code = row.get("INSEE_C")
+            loyer = to_float_fr(row.get("loypredm2"))
+            nb = to_int(row.get("nbobs_com")) or 0
+            r2 = to_float_fr(row.get("R2_adj"))
+            if not code or loyer is None:
+                continue
 
-print("Interrogation de la Carte des loyers (maisons)...")
-loyers_maison = fetch_loyers_layer(1)
-print(f"{len(loyers_maison)} communes (maisons).")
+            if code not in result:
+                result[code] = {"nom": row.get("LIBGEO", "")}
+            result[code].setdefault("loyer", {})
+            result[code]["loyer"][typologie] = {
+                "valeur": round(loyer, 2),
+                "nb": nb,
+                "r2": round(r2, 3) if r2 is not None else None,
+            }
 
+            dept = code_to_dept(code)
+            if dept:
+                poids = nb if nb > 0 else 1
+                dept_loyer_pondere[typologie][dept] = (
+                    dept_loyer_pondere[typologie].get(dept, 0) + loyer * poids
+                )
+                dept_loyer_poids[typologie][dept] = (
+                    dept_loyer_poids[typologie].get(dept, 0) + poids
+                )
 
-def agreger_loyers_par_dept(donnees):
-    """Moyenne pondérée (par nb d'observations) du loyer, par département."""
-    somme_pondere = {}
-    somme_poids = {}
-    for code, (loyer, nb) in donnees.items():
-        dept = code_to_dept(code)
-        if not dept:
-            continue
-        poids = nb if nb > 0 else 1
-        somme_pondere[dept] = somme_pondere.get(dept, 0) + loyer * poids
-        somme_poids[dept] = somme_poids.get(dept, 0) + poids
-    return {
-        dept: round(somme_pondere[dept] / somme_poids[dept], 2)
-        for dept in somme_pondere
-        if somme_poids[dept] > 0
-    }
+for typologie in LOYERS_FICHIERS:
+    for dept, poids in dept_loyer_poids[typologie].items():
+        if poids > 0 and dept in departements:
+            departements[dept].setdefault("loyer", {})
+            departements[dept]["loyer"][typologie] = round(
+                dept_loyer_pondere[typologie][dept] / poids, 2
+            )
 
-
-loyer_dept_appt = agreger_loyers_par_dept(loyers_appt)
-loyer_dept_maison = agreger_loyers_par_dept(loyers_maison)
-
-for dept, entry in departements.items():
-    if dept in loyer_dept_appt:
-        entry["loyer_appartement"] = loyer_dept_appt[dept]
-    if dept in loyer_dept_maison:
-        entry["loyer_maison"] = loyer_dept_maison[dept]
-
-print(f"Loyer moyen calculé pour {len(loyer_dept_appt)} départements (appartements).")
+print("Loyers par typologie intégrés (commune + département).")
 
 # ---------------------------------------------------------------------------
 result["departements"] = departements
