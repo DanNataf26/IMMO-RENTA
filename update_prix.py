@@ -20,8 +20,12 @@ manuellement : python update_prix.py
 
 import csv
 import datetime
+import gzip
 import json
+import os
+import statistics
 import urllib.request
+from collections import defaultdict
 
 SOURCE_URL = "https://www.data.gouv.fr/api/1/datasets/r/851d342f-9c96-41c1-924a-11a7a7aae8a6"
 TMP_CSV = "statistiques_dvf.csv"
@@ -38,6 +42,90 @@ LOYERS_FICHIERS_2025 = {
     "maison": "https://www.data.gouv.fr/api/1/datasets/r/129f764d-b613-44e4-952c-5ff50a8c9b73",
 }
 COMMUNE_REFERENCE = "01053"  # Bourg-en-Bresse : sert à identifier les typologies automatiquement
+
+# Prix par typologie (T1-T2/T3+) calculé sur données DVF BRUTES, avec fenêtre
+# adaptative : 1 an par défaut, élargie jusqu'à MAX_ANNEES si le nombre de
+# ventes est insuffisant pour une commune/typologie donnée.
+SEUIL_VENTES_TYPOLOGIE = 20
+MAX_ANNEES_TYPOLOGIE = 5
+
+
+def url_existe(url):
+    try:
+        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "immo-renta/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def annees_dvf_disponibles(max_annees=MAX_ANNEES_TYPOLOGIE):
+    """Détecte les années DVF brutes disponibles (adresse stable, mise à jour
+    en continu), de la plus récente à la plus ancienne."""
+    annee_courante = datetime.date.today().year
+    trouvees = []
+    for annee in range(annee_courante, annee_courante - 8, -1):
+        url = f"https://files.data.gouv.fr/geo-dvf/latest/csv/{annee}/full.csv.gz"
+        if url_existe(url):
+            trouvees.append(annee)
+        if len(trouvees) >= max_annees:
+            break
+    return trouvees
+
+
+def traiter_annee_dvf_brut(annee, communes_prix, dept_prix, locked_communes, locked_dept):
+    """Télécharge et traite une année de DVF brut national, en ne retenant
+    que les ventes d'un seul appartement (dépendances tolérées à part), et
+    alimente les compteurs par (commune/département, typologie)."""
+    url = f"https://files.data.gouv.fr/geo-dvf/latest/csv/{annee}/full.csv.gz"
+    tmp = f"dvf_full_{annee}.csv.gz"
+    print(f"Téléchargement DVF brut national {annee}...")
+    urllib.request.urlretrieve(url, tmp)
+    print("Téléchargé.")
+
+    # Passe 1 : compter les lots d'habitation par mutation (léger en mémoire)
+    compte = {}
+    with gzip.open(tmp, "rt", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row["type_local"] in ("Appartement", "Maison"):
+                mid = row["id_mutation"]
+                compte[mid] = compte.get(mid, 0) + 1
+
+    # Passe 2 : ne garder que les appartements en mutation à un seul lot
+    with gzip.open(tmp, "rt", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row["type_local"] != "Appartement":
+                continue
+            if compte.get(row["id_mutation"], 0) != 1:
+                continue
+            try:
+                surface = float(row["surface_reelle_bati"] or 0)
+                valeur = float(row["valeur_fonciere"] or 0)
+                pieces = int(float(row["nombre_pieces_principales"] or 0))
+            except ValueError:
+                continue
+            if surface <= 0 or valeur <= 0 or pieces <= 0:
+                continue
+            prix_m2 = valeur / surface
+            if prix_m2 < 500 or prix_m2 > 25000:
+                continue
+
+            typo = "t1t2" if pieces <= 2 else "t3plus"
+            code = row["code_commune"]
+
+            key_c = (code, typo)
+            if key_c not in locked_communes:
+                communes_prix[key_c].append(prix_m2)
+
+            dept = code_to_dept(code)
+            if dept:
+                key_d = (dept, typo)
+                if key_d not in locked_dept:
+                    dept_prix[key_d].append(prix_m2)
+
+    os.remove(tmp)
 
 
 def to_int(v):
@@ -312,6 +400,75 @@ for typologie in LOYERS_FICHIERS:
             )
 
 print(f"Loyers {millesime_loyers} par typologie intégrés (commune + département).")
+
+# ---------------------------------------------------------------------------
+# 4) Prix par typologie (T1-T2 / T3+), calculé sur DVF BRUT (transaction par
+#    transaction), avec fenêtre adaptative : 1 an par défaut, élargie jusqu'à
+#    5 ans si moins de 20 ventes pour une commune/typologie donnée.
+# ---------------------------------------------------------------------------
+communes_prix_typo = defaultdict(list)
+dept_prix_typo = defaultdict(list)
+locked_communes = set()
+locked_dept = set()
+fenetre_communes = {}
+fenetre_dept = {}
+
+annees_dvf = annees_dvf_disponibles()
+print("Années DVF brutes disponibles utilisées :", annees_dvf)
+
+for i, annee in enumerate(annees_dvf, start=1):
+    traiter_annee_dvf_brut(annee, communes_prix_typo, dept_prix_typo, locked_communes, locked_dept)
+
+    nouveaux_c = 0
+    for key, prix in communes_prix_typo.items():
+        if key not in locked_communes and len(prix) >= SEUIL_VENTES_TYPOLOGIE:
+            locked_communes.add(key)
+            fenetre_communes[key] = i
+            nouveaux_c += 1
+    nouveaux_d = 0
+    for key, prix in dept_prix_typo.items():
+        if key not in locked_dept and len(prix) >= SEUIL_VENTES_TYPOLOGIE:
+            locked_dept.add(key)
+            fenetre_dept[key] = i
+            nouveaux_d += 1
+    print(
+        f"Après {i} an(s) : {len(locked_communes)} paires commune/typologie fiables "
+        f"({nouveaux_c} nouvelles), {len(locked_dept)} départements/typologie fiables."
+    )
+
+for key in communes_prix_typo:
+    fenetre_communes.setdefault(key, len(annees_dvf))
+for key in dept_prix_typo:
+    fenetre_dept.setdefault(key, len(annees_dvf))
+
+for (code, typo), prix in communes_prix_typo.items():
+    if not prix:
+        continue
+    if code not in result:
+        result[code] = {"nom": ""}
+    result[code].setdefault("appartement_typologie", {})
+    result[code]["appartement_typologie"][typo] = {
+        "mediane": round(statistics.median(prix)),
+        "nb": len(prix),
+        "fenetre_annees": fenetre_communes[(code, typo)],
+        "fiable": len(prix) >= SEUIL_VENTES_TYPOLOGIE,
+    }
+
+for (dept, typo), prix in dept_prix_typo.items():
+    if not prix or dept not in departements:
+        continue
+    departements[dept].setdefault("appartement_typologie", {})
+    departements[dept]["appartement_typologie"][typo] = {
+        "mediane": round(statistics.median(prix)),
+        "nb": len(prix),
+        "fenetre_annees": fenetre_dept[(dept, typo)],
+        "fiable": len(prix) >= SEUIL_VENTES_TYPOLOGIE,
+    }
+
+print(
+    f"Prix par typologie calculé pour {len(communes_prix_typo)} paires commune/typologie "
+    f"et {len(dept_prix_typo)} paires département/typologie."
+)
 
 # ---------------------------------------------------------------------------
 result["departements"] = departements
